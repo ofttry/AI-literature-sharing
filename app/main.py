@@ -5,6 +5,19 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from fastapi.middleware.cors import CORSMiddleware
 
+app = FastAPI()
+# 添加CORS配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # 数据库配置
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
 engine = create_engine(
@@ -21,19 +34,10 @@ class DBUser(Base):
     username = Column(String(50))
     phone_number = Column(String(20), unique=True, index=True)
     hashed_password = Column(String(200))
+    refresh_token = Column(String(255), nullable=True)
 
 # 创建数据库表（实际生产环境应使用迁移工具）
 Base.metadata.create_all(bind=engine)
-
-app = FastAPI()
-# 添加CORS配置
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # 前端开发地址
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 from pydantic import BaseModel, Field, root_validator
 from passlib.context import CryptContext
@@ -68,7 +72,7 @@ def get_db():
         db.close()
 
 # 注册接口
-@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
+@app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
 def register(user: UserCreate, db: Session = Depends(get_db)):
     
     # 检查用户名是否已存在
@@ -117,19 +121,27 @@ from jose import JWTError, jwt
 SECRET_KEY = "your-secret-key"  # 生产环境应从环境变量获取
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 7  # 7天有效
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+def create_refresh_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+    to_encode.update({"exp": expire, "type": "refresh"})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 class UserLogin(BaseModel):
     phone_number: str
     password: str
 
-class Token(BaseModel):
+class TokenWithRefresh(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str
 
 # 登录接口
-@app.post("/auth/login", response_model=Token)
+@app.post("/api/auth/login", response_model=TokenWithRefresh)
 def login(user: UserLogin, db: Session = Depends(get_db)):
     # 查找用户
     db_user = db.query(DBUser).filter(
@@ -149,11 +161,91 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
         data={"sub": db_user.phone_number},
         expires_delta=access_token_expires
     )
-    
-    return {"access_token": access_token, "token_type": "bearer"}
+    refresh_token_expires = timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    refresh_token = create_refresh_token(
+        data={"sub": db_user.phone_number},
+        expires_delta=refresh_token_expires
+    )
+    # 存到数据库（可选）
+    db_user.refresh_token = refresh_token
+    db.commit()
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="无法验证凭据",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        phone_number: str = payload.get("sub")
+        if phone_number is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = db.query(DBUser).filter(DBUser.phone_number == phone_number).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+class UserInfo(BaseModel):
+    id: int
+    username: str
+    phone_number: str
+
+@app.get("/api/user/me", response_model=UserInfo)
+def read_users_me(current_user: DBUser = Depends(get_current_user)):
+    return UserInfo(
+        id=current_user.id,
+        username=current_user.username,
+        phone_number=current_user.phone_number
+    )
+
+from fastapi import Body
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+@app.post("/api/auth/refresh", response_model=Token)
+def refresh_token(
+    refresh_token: str = Body(..., embed=True),
+    db: Session = Depends(get_db)
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="刷新令牌无效",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise credentials_exception
+        phone_number: str = payload.get("sub")
+        if phone_number is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(DBUser).filter(DBUser.phone_number == phone_number).first()
+    if user is None or user.refresh_token != refresh_token:
+        raise credentials_exception
+
+    # 生成新的 access_token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.phone_number},
+        expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
